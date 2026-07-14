@@ -70,161 +70,38 @@ def polygon_area(poly):
 
     return s * 0.5
 
-
-def make_tabs(poly):
-
-    tabs = []
-
-    ccw = polygon_area(poly) > 0
-
-    n = len(poly)
-
-    for i in range(n):
-
-        p1 = poly[i]
-        p2 = poly[(i + 1) % n]
-
-        dx = p2[0] - p1[0]
-        dy = p2[1] - p1[1]
-
-        L = math.hypot(dx, dy)
-
-        if L < 10:
-            continue
-
-        ux = dx / L
-        uy = dy / L
-
-        if ccw:
-            nx = uy
-            ny = -ux
-        else:
-            nx = -uy
-            ny = ux
-
-        inset = min(5.0, L * 0.2)
-
-        a = (
-            p1[0] + ux * inset,
-            p1[1] + uy * inset,
-        )
-
-        b = (
-            p2[0] - ux * inset,
-            p2[1] - uy * inset,
-        )
-
-        c = (
-            b[0] + nx * TAB_SIZE,
-            b[1] + ny * TAB_SIZE,
-        )
-
-        d = (
-            a[0] + nx * TAB_SIZE,
-            a[1] + ny * TAB_SIZE,
-        )
-
-        tabs.append([a, b, c, d])
-
-    return tabs
-
 # ==========================
-# SVG Path
+# SVG
 # ==========================
 
 def polygon_to_path(poly):
 
-    d = f"M {poly[0][0]} {poly[0][1]} "
+    if len(poly) < 3:
+        return ""
+
+    d = f"M {poly[0][0]:.3f} {poly[0][1]:.3f}"
 
     for x, y in poly[1:]:
+        d += f" L {x:.3f} {y:.3f}"
 
-        d += f"L {x} {y} "
-
-    d += "Z"
+    d += " Z"
 
     return d
-# ==========================
-# SVG Writer
-# ==========================
-import math
-
-TAB_SIZE = 5.0      # mm
-TAB_STEP = 20.0     # 20mm以上の辺だけ貼り代を付ける
 
 
-import math
+def svg_header(min_x, min_y, width, height):
 
-TAB_SIZE = 5.0
-
-def normalize(x, y):
-    l = math.hypot(x, y)
-    if l == 0:
-        return 0.0, 0.0
-    return x / l, y / l
-
-
-def polygon_area(poly):
-    s = 0.0
-    n = len(poly)
-    for i in range(n):
-        x1, y1 = poly[i]
-        x2, y2 = poly[(i + 1) % n]
-        s += x1 * y2 - x2 * y1
-    return s * 0.5
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+viewBox="{min_x:.3f} {min_y:.3f} {width:.3f} {height:.3f}"
+width="{width:.3f}mm"
+height="{height:.3f}mm">
+'''
 
 
-def offset_polygon(poly, dist):
+def svg_footer():
 
-    ccw = polygon_area(poly) > 0
-
-    result = []
-
-    n = len(poly)
-
-    for i in range(n):
-
-        p0 = poly[(i - 1) % n]
-        p1 = poly[i]
-        p2 = poly[(i + 1) % n]
-
-        dx1 = p1[0] - p0[0]
-        dy1 = p1[1] - p0[1]
-
-        dx2 = p2[0] - p1[0]
-        dy2 = p2[1] - p1[1]
-
-        dx1, dy1 = normalize(dx1, dy1)
-        dx2, dy2 = normalize(dx2, dy2)
-
-        if ccw:
-            nx1, ny1 = dy1, -dx1
-            nx2, ny2 = dy2, -dx2
-        else:
-            nx1, ny1 = -dy1, dx1
-            nx2, ny2 = -dy2, dx2
-
-        bx = nx1 + nx2
-        by = ny1 + ny2
-
-        bl = math.hypot(bx, by)
-
-        if bl < 1e-6:
-
-            bx = nx1
-            by = ny1
-
-        else:
-
-            bx /= bl
-            by /= bl
-
-        result.append((
-            p1[0] + bx * dist,
-            p1[1] + by * dist
-        ))
-
-    return result
-
+    return "</svg>\n"
 def make_svg(data, filename):
 
     paths = []
@@ -238,28 +115,26 @@ def make_svg(data, filename):
 
         base = to_mm(part["outer"])
 
-        paths.append(polygon_to_path(base))
-    
-        # 仮に貼り代を付ける辺
-        GLUE_EDGES = set(part.get("glue_edges", []))
+        if len(base) < 3:
+            continue
 
-        tabs = make_tabs(base)
-    
-        for i in GLUE_EDGES:
-    
-            if i < len(tabs):
-    
-                paths.append(
-                    polygon_to_path(tabs[i])
-                )
+        paths.append(polygon_to_path(base))
+
         for x, y in base:
 
-            min_x = min(min_x, x)
-            min_y = min(min_y, y)
-            max_x = max(max_x, x)
-            max_y = max(max_y, y)
+            if x < min_x:
+                min_x = x
 
-    margin = TAB_SIZE + 5
+            if y < min_y:
+                min_y = y
+
+            if x > max_x:
+                max_x = x
+
+            if y > max_y:
+                max_y = y
+
+    margin = 5.0
 
     min_x -= margin
     min_y -= margin
@@ -269,32 +144,57 @@ def make_svg(data, filename):
     width = max_x - min_x
     height = max_y - min_y
 
-    svg = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        f'<svg xmlns="http://www.w3.org/2000/svg" '
-        f'viewBox="{min_x} {min_y} {width} {height}" '
-        f'width="{width}mm" height="{height}mm">'
-    ]
+    svg = []
+
+    svg.append(
+        svg_header(
+            min_x,
+            min_y,
+            width,
+            height
+        )
+    )
 
     for d in paths:
+
         svg.append(
             f'<path d="{d}" '
-            f'fill="none" '
-            f'stroke="black" '
-            f'stroke-width="0.2"/>'
+            'fill="none" '
+            'stroke="black" '
+            'stroke-width="0.2"/>\n'
         )
-
-    svg.append("</svg>")
+            svg.append(
+        svg_footer()
+    )
 
     with open(
         os.path.join(HERE, filename),
         "w",
         encoding="utf-8"
     ) as f:
-        f.write("\n".join(svg))
+
+        f.writelines(svg)
 
     print("Saved:", filename)
 
 
-make_svg(front, "front.svg")
-make_svg(back, "back.svg")
+# ==========================
+# Main
+# ==========================
+
+def main():
+
+    make_svg(
+        front,
+        "front_panel.svg"
+    )
+
+    make_svg(
+        back,
+        "back_panel.svg"
+    )
+
+
+if __name__ == "__main__":
+
+    main()
