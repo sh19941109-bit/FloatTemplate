@@ -238,20 +238,20 @@ def make_svg(data, filename):
 
         base = to_mm(part["outer"])
 
-    paths.append(polygon_to_path(base))
+        paths.append(polygon_to_path(base))
+    
+        # 仮に貼り代を付ける辺
+        GLUE_EDGES = set(part.get("glue_edges", []))
 
-    # 仮に貼り代を付ける辺
-    GLUE_EDGES = {0}
-
-    tabs = make_tabs(base)
-
-    for i in GLUE_EDGES:
-
-        if i < len(tabs):
-
-            paths.append(
-                polygon_to_path(tabs[i])
-            )
+        tabs = make_tabs(base)
+    
+        for i in GLUE_EDGES:
+    
+            if i < len(tabs):
+    
+                paths.append(
+                    polygon_to_path(tabs[i])
+                )
         for x, y in base:
 
             min_x = min(min_x, x)
