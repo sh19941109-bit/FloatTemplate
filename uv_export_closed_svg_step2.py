@@ -1,6 +1,23 @@
-import bpy
-import bmesh
+"""Export closed front/back UV panel SVG and JSON files from the active Blender mesh.
+
+The exporter builds topology in UV space, detects connected UV islands, extracts all
+closed boundary rings (including holes), classifies panels from the source mesh
+normals, and writes even-odd SVG paths plus matching JSON geometry.
+
+Compatible with Blender 5.1/5.2 Python APIs.
+"""
+
+from __future__ import annotations
+
+import json
 import os
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from math import atan2
+from typing import Iterable
+
+import bmesh
+import bpy
 from mathutils import Vector
 
 # ============================================
@@ -9,490 +26,286 @@ from mathutils import Vector
 
 W = 1000
 H = 1000
+UV_KEY_PRECISION = 6
+EPSILON = 1.0e-9
 
 DESKTOP = os.path.join(os.path.expanduser("~"), "OneDrive", "Desktop")
-
-# ============================================
-# Active Mesh
-# ============================================
-
-obj = bpy.context.active_object
-
-if obj is None:
-    raise RuntimeError("No active object.")
-
-if obj.type != "MESH":
-    raise RuntimeError("Active object is not a mesh.")
-
-# ============================================
-# Read Mesh
-# ============================================
-
-bm = bmesh.new()
-bm.from_mesh(obj.data)
-bm.faces.ensure_lookup_table()
-
-uv_layer = bm.loops.layers.uv.active
-
-if uv_layer is None:
-    bm.free()
-    raise RuntimeError("Mesh has no UV map.")
-
-# ============================================
-# Build UV BMesh
-# ============================================
-
-uv_bm = bmesh.new()
-
-vert_map = {}
-uv_face_to_normal = {}
+OUTPUT_DIR = DESKTOP if os.path.isdir(DESKTOP) else os.path.expanduser("~")
 
 
-def get_uv_vert(uv):
+@dataclass(frozen=True)
+class UVFace:
+    """A source mesh face represented by quantized UV vertices."""
 
-    key = (
-        round(uv.x, 6),
-        round(uv.y, 6),
-    )
-
-    if key not in vert_map:
-
-        vert_map[key] = uv_bm.verts.new(
-            (
-                uv.x,
-                uv.y,
-                0.0,
-            )
-        )
-
-    return vert_map[key]
+    index: int
+    verts: tuple[tuple[float, float], ...]
+    normal: Vector
+    area: float
 
 
-for face in bm.faces:
+@dataclass(frozen=True)
+class BoundaryLoop:
+    """A closed ring in UV space."""
 
-    verts = []
+    vertices: tuple[tuple[float, float], ...]
+    area: float
 
-    for loop in face.loops:
 
-        verts.append(
-            get_uv_vert(
-                loop[uv_layer].uv
-            )
-        )
+def uv_key(uv: Vector) -> tuple[float, float]:
+    return (round(float(uv.x), UV_KEY_PRECISION), round(float(uv.y), UV_KEY_PRECISION))
 
+
+def polygon_area(points: Iterable[tuple[float, float]]) -> float:
+    pts = list(points)
+    if len(pts) < 3:
+        return 0.0
+    area = 0.0
+    for idx, (x1, y1) in enumerate(pts):
+        x2, y2 = pts[(idx + 1) % len(pts)]
+        area += x1 * y2 - x2 * y1
+    return area * 0.5
+
+
+def panel_point(point: tuple[float, float]) -> list[float]:
+    x, y = point
+    return [x * W, (1.0 - y) * H]
+
+
+def svg_point(point: tuple[float, float]) -> str:
+    x, y = panel_point(point)
+    return f"{x:.3f} {y:.3f}"
+
+
+def read_uv_faces(obj: bpy.types.Object) -> list[UVFace]:
+    bm = bmesh.new()
     try:
+        bm.from_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+        uv_layer = bm.loops.layers.uv.active
+        if uv_layer is None:
+            raise RuntimeError("Mesh has no active UV map.")
 
-        uv_face = uv_bm.faces.new(verts)
-        uv_face_to_normal[uv_face] = face.normal.copy()
-
-    except ValueError:
-        pass
-
-bm.free()
-
-uv_bm.verts.ensure_lookup_table()
-uv_bm.edges.ensure_lookup_table()
-uv_bm.faces.ensure_lookup_table()
-
-# ============================================
-# UV Island Detection
-# ============================================
+        uv_faces: list[UVFace] = []
+        for face in bm.faces:
+            verts = tuple(uv_key(loop[uv_layer].uv) for loop in face.loops)
+            unique_verts = tuple(dict.fromkeys(verts))
+            area = polygon_area(unique_verts)
+            if len(unique_verts) < 3 or abs(area) <= EPSILON:
+                continue
+            uv_faces.append(UVFace(face.index, unique_verts, face.normal.copy(), abs(area)))
+        return uv_faces
+    finally:
+        bm.free()
 
 
-def find_uv_islands(faces):
+def find_uv_islands(uv_faces: list[UVFace]) -> list[list[UVFace]]:
+    """Find islands by exact UV edge connectivity, not by 3D mesh connectivity."""
+    edge_to_faces: dict[tuple[tuple[float, float], tuple[float, float]], list[int]] = defaultdict(list)
+    for face_idx, face in enumerate(uv_faces):
+        for idx, vert in enumerate(face.verts):
+            nxt = face.verts[(idx + 1) % len(face.verts)]
+            edge_to_faces[tuple(sorted((vert, nxt)))].append(face_idx)
 
-    visited = set()
-    islands = []
-
-    for face in faces:
-
-        if face in visited:
+    neighbors: list[set[int]] = [set() for _ in uv_faces]
+    for face_indices in edge_to_faces.values():
+        if len(face_indices) < 2:
             continue
+        for face_idx in face_indices:
+            neighbors[face_idx].update(other for other in face_indices if other != face_idx)
 
-        island = []
-        stack = [face]
-        visited.add(face)
-
-        while stack:
-
-            current = stack.pop()
-            island.append(current)
-
-            for edge in current.edges:
-
-                for linked in edge.link_faces:
-
-                    if linked not in visited:
-
-                        visited.add(linked)
-                        stack.append(linked)
-
+    islands: list[list[UVFace]] = []
+    visited: set[int] = set()
+    for start_idx in range(len(uv_faces)):
+        if start_idx in visited:
+            continue
+        queue: deque[int] = deque([start_idx])
+        visited.add(start_idx)
+        island: list[UVFace] = []
+        while queue:
+            face_idx = queue.popleft()
+            island.append(uv_faces[face_idx])
+            for neighbor_idx in neighbors[face_idx]:
+                if neighbor_idx not in visited:
+                    visited.add(neighbor_idx)
+                    queue.append(neighbor_idx)
         islands.append(island)
-
     return islands
 
 
-islands = find_uv_islands(uv_bm.faces)
-
-print("UV islands:", len(islands))
-
-# ============================================
-# Boundary Extraction
-# ============================================
-
-
-def island_boundary_edges(island_faces):
-
-    island_set = set(island_faces)
-    boundary = []
-
-    for face in island_faces:
-
-        for edge in face.edges:
-
-            linked_in_island = [
-                linked
-                for linked in edge.link_faces
-                if linked in island_set
-            ]
-
-            if len(linked_in_island) == 1:
-
-                if edge not in boundary:
-                    boundary.append(edge)
-
-    return boundary
+def boundary_edges(island: list[UVFace]) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Return oriented edges that are used by exactly one face in the UV island."""
+    buckets: dict[tuple[tuple[float, float], tuple[float, float]], list[tuple[tuple[float, float], tuple[float, float]]]] = defaultdict(list)
+    for face in island:
+        for idx, vert in enumerate(face.verts):
+            edge = (vert, face.verts[(idx + 1) % len(face.verts)])
+            buckets[tuple(sorted(edge))].append(edge)
+    return [edges[0] for edges in buckets.values() if len(edges) == 1]
 
 
-def trace_boundary_loop(edges, start_edge):
+def outgoing_angle(edge: tuple[tuple[float, float], tuple[float, float]]) -> float:
+    (x1, y1), (x2, y2) = edge
+    return atan2(y2 - y1, x2 - x1)
 
-    edge_map = {}
 
+def extract_boundary_loops(edges: list[tuple[tuple[float, float], tuple[float, float]]]) -> list[BoundaryLoop]:
+    """Trace all closed rings from boundary edges, preserving holes.
+
+    Boundary edges from faces are oriented with the filled island interior on their
+    left. Following those directed edges produces counter-clockwise outer rings and
+    clockwise hole rings in UV coordinates. Branching/non-manifold UV boundaries are
+    handled deterministically by taking the next unused outgoing edge with the
+    smallest left turn.
+    """
+    outgoing: dict[tuple[float, float], list[tuple[tuple[float, float], tuple[float, float]]]] = defaultdict(list)
     for edge in edges:
-        for vert in edge.verts:
-            edge_map.setdefault(vert, []).append(edge)
+        outgoing[edge[0]].append(edge)
+    for start in outgoing:
+        outgoing[start].sort(key=outgoing_angle)
 
-    start_vert = start_edge.verts[0]
+    unused = set(edges)
+    loops: list[BoundaryLoop] = []
 
-    loop = [start_vert]
+    while unused:
+        start_edge = next(iter(unused))
+        current_edge = start_edge
+        vertices: list[tuple[float, float]] = []
+        seen_edges: set[tuple[tuple[float, float], tuple[float, float]]] = set()
 
-    visited = set()
+        while current_edge in unused and current_edge not in seen_edges:
+            seen_edges.add(current_edge)
+            unused.remove(current_edge)
+            start, end = current_edge
+            vertices.append(start)
 
-    current_vert = start_vert
-    current_edge = start_edge
-
-    while True:
-
-        visited.add(current_edge)
-
-        next_vert = (
-            current_edge.verts[1]
-            if current_edge.verts[0] == current_vert
-            else current_edge.verts[0]
-        )
-
-        if next_vert == start_vert:
-            break
-
-        loop.append(next_vert)
-
-        candidates = [
-            e
-            for e in edge_map[next_vert]
-            if e != current_edge
-        ]
-
-        next_edge = None
-
-        for e in candidates:
-            if e not in visited:
-                next_edge = e
+            if end == start_edge[0]:
                 break
 
-        if next_edge is None:
-            break
+            candidates = [edge for edge in outgoing.get(end, []) if edge in unused]
+            if not candidates:
+                break
 
-        current_vert = next_vert
-        current_edge = next_edge
+            incoming_angle = atan2(start[1] - end[1], start[0] - end[0])
+            current_edge = min(
+                candidates,
+                key=lambda edge: (outgoing_angle(edge) - incoming_angle) % (2.0 * 3.141592653589793),
+            )
 
-    return loop, visited
+            if current_edge == start_edge:
+                break
 
-
-def trace_all_boundary_loops(boundary_edges):
-
-    remaining = set(boundary_edges)
-
-    loops = []
-
-    while remaining:
-
-        edge = next(iter(remaining))
-
-        loop, visited = trace_boundary_loop(
-            list(remaining),
-            edge,
-        )
-
-        remaining -= visited
-
-        if len(loop) >= 3:
-            loops.append(loop)
+        if vertices and current_edge[1] == start_edge[0]:
+            area = polygon_area(vertices)
+            if len(vertices) >= 3 and abs(area) > EPSILON:
+                loops.append(BoundaryLoop(tuple(vertices), area))
 
     return loops
 
 
-def signed_area(loop):
-
-    area = 0.0
-    count = len(loop)
-
-    for index in range(count):
-
-        x1 = loop[index].co.x
-        y1 = loop[index].co.y
-        x2 = loop[(index + 1) % count].co.x
-        y2 = loop[(index + 1) % count].co.y
-
-        area += x1 * y2 - x2 * y1
-
-    return area * 0.5
-
-
-def classify_loops(loops):
-
+def split_outer_and_holes(loops: list[BoundaryLoop]) -> tuple[BoundaryLoop | None, list[BoundaryLoop]]:
     if not loops:
         return None, []
-
-    scored = [
-        (abs(signed_area(loop)), loop)
-        for loop in loops
-    ]
-
-    for i, loop in enumerate(loops):
-        print(f"loop {i+1}: area = {signed_area(loop)}")
-
-    scored.sort(key=lambda item: item[0], reverse=True)
-
-    outer = scored[0][1]
-    holes = [loop for _, loop in scored[1:]]
-    
-    print("selected outer =", signed_area(outer))
-    
-    for i, h in enumerate(holes):
-        print(f"selected hole {i+1} =", signed_area(h))
-
-    return outer, holes
+    ordered = sorted(loops, key=lambda loop: abs(loop.area), reverse=True)
+    return ordered[0], ordered[1:]
 
 
-
-# ============================================
-# SVG Path String
-# ============================================
-
-
-def loop_to_subpath(loop):
-
-    area = signed_area(loop)
-
-    # 外周は時計回り、穴は反時計回り
-    if area > 0:
-        loop = list(reversed(loop))
-
-    first = loop[0].co
-
-    parts = [
-        f"M {first.x * W:.3f} {(1.0 - first.y) * H:.3f}",
-    ]
-
-    for vert in loop[1:]:
-        parts.append(
-            f"L {vert.co.x * W:.3f} {(1.0 - vert.co.y) * H:.3f}"
-        )
-
-    parts.append("Z")
-
-    path = " ".join(parts)
-    
-    print("area =", area)
-    print(path[:80])
-    
-    return path
+def loop_to_svg_subpath(loop: BoundaryLoop) -> str:
+    points = loop.vertices
+    first = points[0]
+    segments = [f"M {svg_point(first)}"]
+    segments.extend(f"L {svg_point(point)}" for point in points[1:])
+    segments.append("Z")
+    return " ".join(segments)
 
 
-def island_to_path_d(outer, holes):
-
-    subpaths = [loop_to_subpath(outer)]
-
-    for hole in holes:
-        subpaths.append(loop_to_subpath(hole))
-        
-    return " ".join(subpaths)
+def island_to_path(outer: BoundaryLoop, holes: list[BoundaryLoop]) -> str:
+    # One compound path with fill-rule=evenodd makes hole winding irrelevant and reliable.
+    return " ".join(loop_to_svg_subpath(loop) for loop in [outer, *holes])
 
 
-def island_average_normal(island_faces):
-
-    total = Vector((0.0, 0.0, 0.0))
-    count = 0
-
-    for face in island_faces:
-
-        orig = uv_face_to_normal.get(face)
-
-        if orig is None:
-            continue
-
-        total += orig
-        count += 1
-
-    if count == 0:
-        return Vector((0.0, 0.0, 0.0))
-
-    return total / count
+def classify_panel(island: list[UVFace]) -> str:
+    weighted = Vector((0.0, 0.0, 0.0))
+    for face in island:
+        weighted += face.normal * face.area
+    # Front/back panels in this template are separated by the sign of the mesh Y normal.
+    # Ties are treated as front for deterministic output.
+    return "front" if weighted.y >= 0.0 else "back"
 
 
-def classify_panel(island_faces):
-
-    normal = island_average_normal(island_faces)
-
-    if normal.y >= 0.0:
-        return "front"
-
-    return "back"
+def loop_json(loop: BoundaryLoop) -> list[list[float]]:
+    return [panel_point(point) for point in loop.vertices]
 
 
-# ============================================
-# Build Panel Paths
-# ============================================
-
-panel_paths = {
-    "front": [],
-    "back": []
-}
-
-panel_json = {
-    "front": [],
-    "back": []
-}
-
-for index, island_faces in enumerate(islands):
-
-    boundary_edges = island_boundary_edges(island_faces)
-
-    print(
-        f"Island {index + 1}: "
-        f"faces={len(island_faces)}, "
-        f"boundary_edges={len(boundary_edges)}"
-    )
-
-    loops = trace_all_boundary_loops(boundary_edges)
-
-    print(f"  boundary loops: {len(loops)}")
-
-    outer, holes = classify_loops(loops)
-
-    print(type(outer[0]))
-    print(type(holes[0][0]) if holes else "no holes")
-
-    if outer is None:
-        print(f"  skipped: no valid outer loop")
-        continue
-
-    print(f"  outer vertices: {len(outer)}")
-    print(f"  holes: {len(holes)}")
-
-    path_d = island_to_path_d(outer, holes)
-    panel = classify_panel(island_faces)
-    
-    panel_paths[panel].append(path_d)
-    
-    # JSON用データを保存
-    # JSON用データを保存（UV座標）
-    panel_json[panel] = {
-
-    "outer": [
-        [
-            v.co.x * W,
-            (1.0 - v.co.y) * H
-        ]
-        for v in outer
-    ],
-
-    "holes": [
-        [
-            [
-                v.co.x * W,
-                (1.0 - v.co.y) * H
-            ]
-            for v in hole
-        ]
-        for hole in holes
-    ],
-
-    # ★追加
-    "glue_edges": list(range(len(outer)))
-
-}
-    
-    print(f"panel: {panel}")
-
-# ==========================================
-# Write SVG
-# ==========================================
-
-# ==========================================
-# Add glue tab (5 mm offset)
-# ==========================================
-
-TAB_SIZE = 5.0  # mm
-
-def add_glue_tab(path_d):
-    # 今はダミー
-    # 後でここへ5mmオフセット処理を書く
-    return path_d
-
-
-def write_panel_svg(filename, path_list):
-
-    if not path_list:
-        print(f"Warning: no paths for {filename}")
-        path_list = [""]
-
-    combined_d = " ".join(add_glue_tab(p) for p in path_list)
-
+def write_panel_svg(filename: str, paths: list[str]) -> None:
+    combined_d = " ".join(paths)
     svg = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
-        f'<svg xmlns="http://www.w3.org/2000/svg" '
-        f'viewBox="0 0 {W} {H}" '
-        f'width="{W}" height="{H}">\n'
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}">\n'
         f'  <path fill="#000000" fill-rule="evenodd" stroke="none" d="{combined_d}"/>\n'
-        f'</svg>\n'
+        '</svg>\n'
     )
-
-    filepath = os.path.join(DESKTOP, filename)
-
+    filepath = os.path.join(OUTPUT_DIR, filename)
     with open(filepath, "w", encoding="utf-8") as handle:
         handle.write(svg)
-
-    print(f"Saved: {filepath}")
-    
-import json
-
-def write_panel_json(filename, data):
-
-    filepath = os.path.join(DESKTOP, filename)
-
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
     print(f"Saved: {filepath}")
 
 
-write_panel_svg("front_panel.svg", panel_paths["front"])
-write_panel_svg("back_panel.svg", panel_paths["back"])
+def write_panel_json(filename: str, islands: list[dict[str, object]]) -> None:
+    payload = {"width": W, "height": H, "islands": islands}
+    filepath = os.path.join(OUTPUT_DIR, filename)
+    with open(filepath, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    print(f"Saved: {filepath}")
 
-write_panel_json("front_panel.json", panel_json["front"])
-write_panel_json("back_panel.json", panel_json["back"])
 
-uv_bm.free()
+def main() -> None:
+    obj = bpy.context.active_object
+    if obj is None:
+        raise RuntimeError("No active object.")
+    if obj.type != "MESH":
+        raise RuntimeError("Active object is not a mesh.")
 
-print("Done.")
+    uv_faces = read_uv_faces(obj)
+    if not uv_faces:
+        raise RuntimeError("Active mesh has no non-degenerate UV faces.")
+
+    islands = find_uv_islands(uv_faces)
+    print(f"UV islands: {len(islands)}")
+
+    panel_paths: dict[str, list[str]] = {"front": [], "back": []}
+    panel_json: dict[str, list[dict[str, object]]] = {"front": [], "back": []}
+
+    for island_index, island in enumerate(islands, start=1):
+        edges = boundary_edges(island)
+        loops = extract_boundary_loops(edges)
+        outer, holes = split_outer_and_holes(loops)
+        print(
+            f"Island {island_index}: faces={len(island)}, "
+            f"boundary_edges={len(edges)}, boundary_loops={len(loops)}"
+        )
+
+        if outer is None:
+            print(f"  skipped island {island_index}: no closed boundary loop")
+            continue
+
+        panel = classify_panel(island)
+        panel_paths[panel].append(island_to_path(outer, holes))
+        panel_json[panel].append(
+            {
+                "outer": loop_json(outer),
+                "holes": [loop_json(hole) for hole in holes],
+                "glue_edges": list(range(len(outer.vertices))),
+                "source_face_indices": [face.index for face in island],
+            }
+        )
+        print(f"  panel={panel}, outer_vertices={len(outer.vertices)}, holes={len(holes)}")
+
+    write_panel_svg("front_panel.svg", panel_paths["front"])
+    write_panel_svg("back_panel.svg", panel_paths["back"])
+    write_panel_json("front_panel.json", panel_json["front"])
+    write_panel_json("back_panel.json", panel_json["back"])
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
