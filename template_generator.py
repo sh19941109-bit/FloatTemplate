@@ -71,6 +71,76 @@ def polygon_area(poly):
     return s * 0.5
 
 # ==========================
+# Glue Tabs
+# ==========================
+
+def add_glue_tabs(polygon, glue_edges):
+    """
+    Add glue tabs to specified edges of a polygon.
+    
+    Args:
+        polygon: List of (x, y) tuples representing polygon vertices
+        glue_edges: List of edge indices (0-based) to add tabs to
+    
+    Returns:
+        List of (x, y) tuples with glue tabs added
+    """
+    if not glue_edges or len(polygon) < 3:
+        return polygon
+    
+    result = []
+    n = len(polygon)
+    
+    for i in range(n):
+        result.append(polygon[i])
+        
+        # Check if this edge needs a glue tab
+        if i in glue_edges:
+            p1 = polygon[i]
+            p2 = polygon[(i + 1) % n]
+            
+            # Calculate edge vector
+            dx = p2[0] - p1[0]
+            dy = p2[1] - p1[1]
+            edge_length = math.sqrt(dx * dx + dy * dy)
+            
+            if edge_length > 0:
+                # Normalize direction
+                dx /= edge_length
+                dy /= edge_length
+                
+                # Perpendicular vector (rotate 90 degrees)
+                px = -dy
+                py = dx
+                
+                # Tab points (add 3 points to create a rectangular tab)
+                tab_depth = TAB_SIZE
+                tab_width = TAB_SIZE
+                
+                # Start point on edge (offset from p1)
+                start_offset = (edge_length - tab_width) / 2
+                start_x = p1[0] + dx * start_offset
+                start_y = p1[1] + dy * start_offset
+                
+                # Tab corners
+                tab_corner1_x = start_x + dx * tab_width
+                tab_corner1_y = start_y + dy * tab_width
+                
+                tab_outer_x = start_x + px * tab_depth
+                tab_outer_y = start_y + py * tab_depth
+                
+                tab_corner2_x = tab_corner1_x + px * tab_depth
+                tab_corner2_y = tab_corner1_y + py * tab_depth
+                
+                # Add tab vertices
+                result.append((start_x, start_y))
+                result.append((tab_outer_x, tab_outer_y))
+                result.append((tab_corner2_x, tab_corner2_y))
+                result.append((tab_corner1_x, tab_corner1_y))
+    
+    return result
+
+# ==========================
 # SVG
 # ==========================
 
@@ -102,6 +172,7 @@ height="{height:.3f}mm">
 def svg_footer():
 
     return "</svg>\n"
+
 def make_svg(data, filename):
 
     paths = []
@@ -117,6 +188,11 @@ def make_svg(data, filename):
 
         if len(base) < 3:
             continue
+
+        # Apply glue tabs if specified
+        glue_edges = part.get("glue_edges", [])
+        if glue_edges:
+            base = add_glue_tabs(base, glue_edges)
 
         paths.append(polygon_to_path(base))
 
@@ -163,9 +239,8 @@ def make_svg(data, filename):
             'stroke="black" '
             'stroke-width="0.2"/>\n'
         )
-            svg.append(
-        svg_footer()
-    )
+
+    svg.append(svg_footer())
 
     with open(
         os.path.join(HERE, filename),
