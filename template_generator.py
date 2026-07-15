@@ -51,6 +51,123 @@ def to_mm(points):
         ))
 
     return out
+
+# ==========================
+# Bounding Box
+# ==========================
+
+def get_polygon_bounds(poly):
+    """
+    Calculate bounding box for a single polygon.
+    Returns (min_x, min_y, max_x, max_y)
+    """
+    if not poly:
+        return None
+    
+    min_x = float("inf")
+    min_y = float("inf")
+    max_x = float("-inf")
+    max_y = float("-inf")
+    
+    for x, y in poly:
+        if x < min_x:
+            min_x = x
+        if y < min_y:
+            min_y = y
+        if x > max_x:
+            max_x = x
+        if y > max_y:
+            max_y = y
+    
+    return (min_x, min_y, max_x, max_y)
+
+def get_part_bounds(part):
+    """
+    Calculate bounding box for a part (outer + all holes).
+    Returns (min_x, min_y, max_x, max_y)
+    """
+    min_x = float("inf")
+    min_y = float("inf")
+    max_x = float("-inf")
+    max_y = float("-inf")
+    
+    # Check outer boundary
+    outer = to_mm(part["outer"])
+    bounds = get_polygon_bounds(outer)
+    if bounds:
+        min_x = min(min_x, bounds[0])
+        min_y = min(min_y, bounds[1])
+        max_x = max(max_x, bounds[2])
+        max_y = max(max_y, bounds[3])
+    
+    # Check holes
+    holes = part.get("holes", [])
+    for hole in holes:
+        hole_mm = to_mm(hole)
+        bounds = get_polygon_bounds(hole_mm)
+        if bounds:
+            min_x = min(min_x, bounds[0])
+            min_y = min(min_y, bounds[1])
+            max_x = max(max_x, bounds[2])
+            max_y = max(max_y, bounds[3])
+    
+    if min_x == float("inf"):
+        return None
+    
+    return (min_x, min_y, max_x, max_y)
+
+# ==========================
+# Layout / Packing
+# ==========================
+
+def pack_parts(data, page_width=400.0, page_height=400.0, margin=5.0):
+    """
+    Pack multiple parts onto a page using a simple shelf-packing algorithm.
+    Returns list of (part_index, offset_x, offset_y) tuples.
+    """
+    packed = []
+    shelf_y = margin
+    shelf_height = 0
+    current_x = margin
+    
+    # Get bounds for all parts
+    part_info = []
+    for i, part in enumerate(data):
+        bounds = get_part_bounds(part)
+        if bounds:
+            min_x, min_y, max_x, max_y = bounds
+            width = max_x - min_x
+            height = max_y - min_y
+            part_info.append((i, width, height, min_x, min_y))
+    
+    # Sort by height (descending) for better packing
+    part_info.sort(key=lambda x: x[2], reverse=True)
+    
+    # Pack each part
+    for part_idx, width, height, local_min_x, local_min_y in part_info:
+        # Check if part fits in current shelf
+        if current_x + width + margin > page_width:
+            # Start new shelf
+            shelf_y += shelf_height + margin
+            current_x = margin
+            shelf_height = 0
+        
+        # Check if part fits on page vertically
+        if shelf_y + height + margin > page_height:
+            print(f"Warning: Part {part_idx} may not fit on page")
+        
+        # Calculate offset to position part at current_x, shelf_y
+        # The offset should move the part's local min to the placement position
+        offset_x = current_x - local_min_x
+        offset_y = shelf_y - local_min_y
+        
+        packed.append((part_idx, offset_x, offset_y))
+        
+        current_x += width + margin
+        shelf_height = max(shelf_height, height)
+    
+    return packed
+
 # ==========================
 # Offset
 # ==========================
@@ -69,6 +186,12 @@ def polygon_area(poly):
         s += x1 * y2 - x2 * y1
 
     return s * 0.5
+
+def apply_offset(points, offset_x, offset_y):
+    """
+    Apply offset to a list of points.
+    """
+    return [(x + offset_x, y + offset_y) for x, y in points]
 
 # ==========================
 # Glue Tabs
@@ -182,9 +305,25 @@ def make_svg(data, filename):
     max_x = float("-inf")
     max_y = float("-inf")
 
-    for part in data:
+    # Pack parts to compute layout
+    packed_parts = pack_parts(data)
+    
+    # Build mapping of part index to offset
+    part_offsets = {}
+    for part_idx, offset_x, offset_y in packed_parts:
+        part_offsets[part_idx] = (offset_x, offset_y)
+    
+    # Process each part with its offset
+    for part_idx, part in enumerate(data):
 
+        if part_idx not in part_offsets:
+            continue
+        
+        offset_x, offset_y = part_offsets[part_idx]
+
+        # Process outer boundary
         base = to_mm(part["outer"])
+        base = apply_offset(base, offset_x, offset_y)
 
         if len(base) < 3:
             continue
@@ -209,6 +348,25 @@ def make_svg(data, filename):
 
             if y > max_y:
                 max_y = y
+
+        # Process holes
+        holes = part.get("holes", [])
+        for hole in holes:
+            hole_mm = to_mm(hole)
+            hole_mm = apply_offset(hole_mm, offset_x, offset_y)
+            
+            if len(hole_mm) >= 3:
+                paths.append(polygon_to_path(hole_mm))
+                
+                for x, y in hole_mm:
+                    if x < min_x:
+                        min_x = x
+                    if y < min_y:
+                        min_y = y
+                    if x > max_x:
+                        max_x = x
+                    if y > max_y:
+                        max_y = y
 
     margin = 5.0
 
